@@ -1,0 +1,18 @@
+Overriding: out_dir = out-shakespeare-char
+Overriding: num_samples = 1
+Overriding: max_new_tokens = 250
+Overriding: temperature = 0.8
+number of parameters: 10.65M
+Loading meta from data\shakespeare_char\meta.pkl...
+
+
+ANGELO:
+O, who's the son, but by the boar of the ground?
+
+ANGELO:
+Farewell, uncle, my lord: let meet with my face,
+I will not toward to the heart of hell
+Which misters not will it this virtue to the next
+And all tell in the letters of child:
+Supply 
+---------------

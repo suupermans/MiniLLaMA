@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+
 import math
 import inspect
 from dataclasses import dataclass
@@ -48,6 +49,10 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        # 添加kv cache缓存配置参数（命名统一小写，和 forward / kv_cache_on 里的引用一致）
+        self.use_cache = False
+        self.cache_k = None  # (B, nh, T_past, hs) 该层见过的全部 key
+        self.cache_v = None  # (B, nh, T_past, hs) 该层见过的全部 value
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -58,8 +63,18 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        if self.use_cache:
+            # 有历史 → decode：把新 k/v 接到缓存尾巴上（dim=2 是序列维）
+            if self.cache_k is not None:
+                k = torch.cat([self.cache_k, k], dim=2)
+                v = torch.cat([self.cache_v, v], dim=2)
+            # 无论 prefill 还是 decode，存的都是"完整历史"（这行必须在 use_cache 分支内！）
+            self.cache_k, self.cache_v = k, v
+            is_prefill = (k.size(2) == T)  # key 全来自当前输入 → prefill，需要因果遮罩
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_prefill)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
@@ -171,7 +186,12 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        attn0 = self.transformer.h[0].attn
+        if attn0.use_cache and attn0.cache_k is not None:
+            past_t = attn0.cache_k.shape[2]
+            pos = torch.arange(past_t,past_t + t,dtype = torch.long,device = device)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -301,19 +321,44 @@ class GPT(nn.Module):
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
-
+    
+    def kv_cache_on(self):
+        for block in self.transformer.h:
+            block.attn.use_cache = True
+            block.attn.cache_k = None
+            block.attn.cache_v = None
+    
+    def kv_cache_off(self):
+        for block in self.transformer.h:
+            block.attn.use_cache = False
+            block.attn.cache_k = None
+            block.attn.cache_v = None
+    
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+
+        KV-cache version: the whole prompt is forwarded ONCE (prefill), filling every
+        layer's cache; each later step forwards only the single new token (decode),
+        which attends over the cached K/V. Same results as the naive loop, far less
+        redundant computation.
         """
+        # the cache grows by one token per step and wpe only has block_size rows,
+        # so generation cannot run past the window (no sliding-window eviction here)
+        idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+        room = self.config.block_size - idx_cond.size(1)
+        if max_new_tokens > room:
+            print(f"WARNING: KV cache caps generation at {room} tokens (block_size={self.config.block_size}, "
+                  f"prompt of {idx_cond.size(1)}); clamping max_new_tokens from {max_new_tokens}.")
+            max_new_tokens = room
+
+        self.kv_cache_on()
+        # prefill: forward the whole prompt once; every layer's K/V lands in the cache
+        logits, _ = self(idx_cond)
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -326,5 +371,8 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+            # decode: forward ONLY the fresh token; its q attends over the cached K/V
+            logits, _ = self(idx_next)
+        self.kv_cache_off()
 
         return idx
