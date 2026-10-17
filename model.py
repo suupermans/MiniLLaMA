@@ -27,6 +27,43 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RMSNorm(nn.Module):
+    """Root Mean Square LayerNorm（LLaMA 式）：不减均值、无偏置，只做均方根缩放"""
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        x_dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * x.to(x_dtype)
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)          # d 维拆两半，视为 d/2 个配对 (x1i, x2i)
+    return torch.cat([-x2, x1], dim=-1)  # 每对旋转 90° 的分量
+
+class Rotary(nn.Module):
+    """RoPE：预计算 cos/sin 查表，把绝对位置以旋转方式注入 q/k"""
+    def __init__(self, head_dim, max_seq_len, base=10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))  # 各平面频率
+        t = torch.arange(max_seq_len)
+        freqs = torch.outer(t, inv_freq)         # (max_seq_len, head_dim//2) 位置×平面 的角度
+        emb = torch.cat((freqs, freqs), dim=-1)  # (max_seq_len, head_dim)
+        self.register_buffer("cos", emb.cos(), persistent=False)
+        self.register_buffer("sin", emb.sin(), persistent=False)
+
+    def forward(self, q, k, past_t=0):
+        # q, k: (B, nh, T, hs) — 用绝对位置 [past_t, past_t+T) 的角度旋转
+        T = q.shape[2]
+        cos = self.cos[past_t:past_t + T].view(1, 1, T, -1)
+        sin = self.sin[past_t:past_t + T].view(1, 1, T, -1)
+        q = q * cos + rotate_half(q) * sin
+        k = k * cos + rotate_half(k) * sin
+        return q, k
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -53,6 +90,8 @@ class CausalSelfAttention(nn.Module):
         self.use_cache = False
         self.cache_k = None  # (B, nh, T_past, hs) 该层见过的全部 key
         self.cache_v = None  # (B, nh, T_past, hs) 该层见过的全部 value
+        # RoPE：q/k 的旋转位置编码（v 不转——位置只该影响打分，不该污染内容）
+        self.rotary = Rotary(config.n_embd // config.n_head, config.block_size)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -62,6 +101,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # RoPE：按绝对位置旋转 q/k；必须在进缓存 cat 之前做！
+        # （缓存里存的是已旋转的 k；新 k 用自己的位置 past_t 转完，再接队尾）
+        past_t = 0 if (not self.use_cache or self.cache_k is None) else self.cache_k.shape[2]
+        q, k = self.rotary(q, k, past_t)
 
         if self.use_cache:
             # 有历史 → decode：把新 k/v 接到缓存尾巴上（dim=2 是序列维）
@@ -91,28 +135,29 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
+    """SwiGLU 前馈层（LLaMA 式）：门控 FFN，hidden 取 8/3·d 向上取整到 64 的倍数
+    （3 份 8/3·d·d 参数 = 8d²，和旧 GELU-MLP 参数量恰好持平——LLaMA 选 8/3 的心机）"""
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        hidden = int(8 * config.n_embd / 3)
+        hidden = 64 * ((hidden + 63) // 64)   # 对齐 64，利于 GPU kernel
+        self.w_gate = nn.Linear(config.n_embd, hidden, bias=False)
+        self.w_up   = nn.Linear(config.n_embd, hidden, bias=False)
+        self.w_down = nn.Linear(hidden, config.n_embd, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        x = self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+        return self.dropout(x)
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -140,10 +185,9 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -170,7 +214,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and hasattr(self.transformer, 'wpe'):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -186,17 +230,11 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        attn0 = self.transformer.h[0].attn
-        if attn0.use_cache and attn0.cache_k is not None:
-            past_t = attn0.cache_k.shape[2]
-            pos = torch.arange(past_t,past_t + t,dtype = torch.long,device = device)
-        else:
-            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # RoPE 版：位置信息已在 attention 内部以旋转注入，这里不再有任何位置 embedding
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -218,7 +256,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if hasattr(self.transformer, 'wpe'):
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
