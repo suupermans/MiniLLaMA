@@ -64,6 +64,22 @@ class Rotary(nn.Module):
         k = k * cos + rotate_half(k) * sin
         return q, k
 
+class LoRALinear(nn.Module):
+    """LoRA：冻结原权重 W，只训练低秩旁路 B·A（B 初始为 0 → 起点等于原模型）
+    前向 = W·x + scale·(x·Aᵀ·Bᵀ)；可训练参数从 d_out·d_in 降到 r·(d_in+d_out)"""
+    def __init__(self, base: nn.Linear, r=8, alpha=16):
+        super().__init__()
+        self.base = base                                   # 原始线性层（冻结）
+        for p in self.base.parameters():
+            p.requires_grad = False
+        d_out, d_in = base.weight.shape
+        self.A = nn.Parameter(torch.randn(r, d_in) * (1.0 / math.sqrt(d_in)))
+        self.B = nn.Parameter(torch.zeros(d_out, r))       # 全零初始化：训练起点 = 原模型
+        self.scale = alpha / r
+
+    def forward(self, x):
+        return self.base(x) + self.scale * ((x @ self.A.T) @ self.B.T)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -373,6 +389,38 @@ class GPT(nn.Module):
             block.attn.cache_k = None
             block.attn.cache_v = None
     
+    def apply_lora(self, r=8, alpha=16):
+        """把 attention 和 MLP 里的所有 nn.Linear 换成 LoRALinear，并冻结非 LoRA 参数"""
+        replaced = 0
+        for block in self.transformer.h:
+            for parent in (block.attn, block.mlp):
+                for child_name, child in list(parent.named_children()):
+                    if isinstance(child, nn.Linear):
+                        setattr(parent, child_name, LoRALinear(child, r=r, alpha=alpha))
+                        replaced += 1
+        # 只放开 LoRA 的 A/B，其余参数全部冻结
+        for pn, p in self.named_parameters():
+            p.requires_grad = pn.endswith('.A') or pn.endswith('.B')
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(f"LoRA: wrapped {replaced} Linear layers | "
+              f"trainable {trainable:,} / {total:,} params ({100*trainable/total:.3f}%)")
+
+    @torch.no_grad()
+    def merge_lora(self):
+        """把 B·A 合并进原权重，模型回到普通结构（合并后保存的 ckpt 可直接被 sample.py 加载）"""
+        for block in self.transformer.h:
+            for parent in (block.attn, block.mlp):
+                for child_name, child in list(parent.named_children()):
+                    if isinstance(child, LoRALinear):
+                        merged = nn.Linear(child.base.in_features, child.base.out_features,
+                                           bias=child.base.bias is not None).to(child.base.weight.device)
+                        merged.weight.data = child.base.weight.data + child.scale * (child.B @ child.A)
+                        if child.base.bias is not None:
+                            merged.bias.data = child.base.bias.data
+                        setattr(parent, child_name, merged)
+        print("LoRA merged into base weights")
+
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
